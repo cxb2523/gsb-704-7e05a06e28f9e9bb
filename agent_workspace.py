@@ -81,7 +81,8 @@ class Workspace:
     def __init__(self, load_rows):
         self.load_rows = load_rows
 
-    def query(self, args):
+    @staticmethod
+    def _validate(args):
         sql = args.get('sql')
         params = args.get('params', [])
         offset, limit = args.get('offset', 0), args.get('limit', 30)
@@ -91,10 +92,10 @@ class Workspace:
             raise WorkspaceError('params 必须是最多100个字符串、数字或null')
         if type(offset) is not int or offset < 0 or offset > 1_000_000 or type(limit) is not int or not 1 <= limit <= MAX_ROWS:
             raise WorkspaceError('offset/limit 超出分页范围')
-        db = sqlite3.connect(':memory:')
-        db.row_factory = sqlite3.Row
-        needed = set()
+        return sql, params, offset, limit
 
+    @staticmethod
+    def _authorizer(needed):
         def authorize(action, first, second, *_):
             if action == sqlite3.SQLITE_READ:
                 if first not in TABLES:
@@ -106,21 +107,87 @@ class Workspace:
             if action == sqlite3.SQLITE_FUNCTION and str(second).lower() in FUNCTIONS:
                 return sqlite3.SQLITE_OK
             return sqlite3.SQLITE_DENY
+        return authorize
 
+    def _connect(self):
+        db = sqlite3.connect(':memory:')
+        db.row_factory = sqlite3.Row
+        for table, (_, columns) in TABLES.items():
+            definitions = ','.join('"' + col + '" ' + ('REAL' if col in NUMBERS else 'TEXT') for col in columns.split() + ['data'])
+            db.execute(f'CREATE TABLE "{table}" ({definitions})')
+        for name, value in [('SQLITE_LIMIT_LENGTH', 1_000_000), ('SQLITE_LIMIT_SQL_LENGTH', 8_000),
+                            ('SQLITE_LIMIT_COLUMN', 64), ('SQLITE_LIMIT_EXPR_DEPTH', 50),
+                            ('SQLITE_LIMIT_VDBE_OP', 50_000), ('SQLITE_LIMIT_VARIABLE_NUMBER', 100),
+                            ('SQLITE_LIMIT_LIKE_PATTERN_LENGTH', 256)]:
+            if hasattr(db, 'setlimit'):
+                db.setlimit(getattr(sqlite3, name), value)
+        return db
+
+    def _compile(self, sql, params):
+        """Authorize and compile SQL on a schema-only database and check the result shape.
+
+        Returns (db, needed, description) with the connection left open for the
+        caller to close. No business row is ever inserted or read here: EXPLAIN
+        only compiles, and preparing the statement exposes just column names.
+        Reading those names may run the first VM steps against the still empty
+        schema, so the same CPU budget as query keeps runaway queries bounded.
+        """
+        db = self._connect()
+        needed = set()
         try:
-            for table, (_, columns) in TABLES.items():
-                definitions = ','.join('"' + col + '" ' + ('REAL' if col in NUMBERS else 'TEXT') for col in columns.split() + ['data'])
-                db.execute(f'CREATE TABLE "{table}" ({definitions})')
-            for name, value in [('SQLITE_LIMIT_LENGTH', 1_000_000), ('SQLITE_LIMIT_SQL_LENGTH', 8_000),
-                                ('SQLITE_LIMIT_COLUMN', 64), ('SQLITE_LIMIT_EXPR_DEPTH', 50),
-                                ('SQLITE_LIMIT_VDBE_OP', 50_000), ('SQLITE_LIMIT_VARIABLE_NUMBER', 100),
-                                ('SQLITE_LIMIT_LIKE_PATTERN_LENGTH', 256)]:
-                if hasattr(db, 'setlimit'):
-                    db.setlimit(getattr(sqlite3, name), value)
-            db.set_authorizer(authorize)
+            db.set_authorizer(self._authorizer(needed))
             # Compilation discovers only the tables needed for this query.
             # EXPLAIN never executes an expression or reads business rows.
             db.execute('EXPLAIN ' + sql, params).close()
+            deadline, steps = time.monotonic() + 2, 0
+            def progress():
+                nonlocal steps
+                steps += 100
+                return int(steps > 1_000_000 or time.monotonic() > deadline)
+            db.set_progress_handler(progress, 100)
+            cursor = db.execute(sql, params)
+            description = cursor.description
+            cursor.close()
+            db.set_progress_handler(None, 0)
+            if description is None:
+                raise WorkspaceError('工作区仅支持只读查询')
+            if len({c[0] for c in description}) != len(description):
+                raise WorkspaceError('结果列名重复，请用 AS 为列设置不同名称')
+            if len(description) > 20 or any(len(c[0]) > 64 for c in description):
+                raise WorkspaceError('请最多选择20列，并使用不超过64字符的列名')
+            return db, needed, description
+        except Exception:
+            db.close()
+            raise
+
+    def plan(self, args):
+        """Read-only preflight: validate, authorize and compile SQL without reading rows.
+
+        Shares validation, authorizer and column-shape rules with query, so a
+        statement is admitted by plan if and only if query would admit it.
+        The disposable database never holds business rows, nothing is executed
+        against real data and no result rows enter the context.
+        """
+        sql, params, offset, limit = self._validate(args)
+        try:
+            db, needed, description = self._compile(sql, params)
+        except (sqlite3.Error, OverflowError, ValueError) as exc:
+            raise WorkspaceError('只读查询未完成：' + str(exc)[:180]) from None
+        else:
+            db.close()
+        columns = [c[0] for c in description]
+        return {'readOnly': True, 'compiled': True, 'tables': sorted(needed),
+                'columns': columns, 'columnCount': len(columns),
+                'columnCountLimited': len(columns) > 20,
+                'columnNameLengthLimited': any(len(name) > 64 for name in columns),
+                'offset': offset, 'limit': limit,
+                'note': 'plan 只做校验与编译，未读取或返回任何业务数据；取数请用 workspace_query。'}
+
+    def query(self, args):
+        sql, params, offset, limit = self._validate(args)
+        db = None
+        try:
+            db, needed, description = self._compile(sql, params)
             db.set_authorizer(None)
             for table in sorted(needed):
                 columns = TABLES[table][1].split() + ['data']
@@ -133,7 +200,7 @@ class Workspace:
                                (tuple(values(row)) for row in self.load_rows(table)))
             db.commit()
             db.execute('PRAGMA query_only=ON')
-            db.set_authorizer(authorize)
+            db.set_authorizer(self._authorizer(needed))
             deadline, steps = time.monotonic() + 2, 0
             def progress():
                 nonlocal steps
@@ -141,12 +208,6 @@ class Workspace:
                 return int(steps > 1_000_000 or time.monotonic() > deadline)
             db.set_progress_handler(progress, 100)
             cursor = db.execute(sql, params)
-            if cursor.description is None:
-                raise WorkspaceError('工作区仅支持只读查询')
-            if len({c[0] for c in cursor.description}) != len(cursor.description):
-                raise WorkspaceError('结果列名重复，请用 AS 为列设置不同名称')
-            if len(cursor.description) > 20 or any(len(c[0]) > 64 for c in cursor.description):
-                raise WorkspaceError('请最多选择20列，并使用不超过64字符的列名')
             # Offset is bounded and subject to the same CPU deadline.
             for _ in range(offset):
                 if cursor.fetchone() is None:
@@ -181,7 +242,7 @@ class Workspace:
                     break
                 rows.append(row)
             clipped = [item for item in {(item['row'], item['column']): item for item in clipped}.values() if item['row'] < offset + len(rows)]
-            result = {'columns': [c[0] for c in cursor.description], 'rows': rows, 'shown': len(rows),
+            result = {'columns': [c[0] for c in description], 'rows': rows, 'shown': len(rows),
                     'offset': offset, 'nextOffset': offset + len(rows) if more else None,
                     'hasMore': more, 'clipped': clipped,
                     'note': 'clipped 中的字段未返回全文，请按表和id用 workspace_read 读取；hasMore 表示查询尚有后续行。'}
@@ -191,7 +252,8 @@ class Workspace:
         except (sqlite3.Error, OverflowError, ValueError) as exc:
             raise WorkspaceError('只读查询未完成：' + str(exc)[:180]) from None
         finally:
-            db.close()
+            if db is not None:
+                db.close()
 
     def read(self, args):
         table, record_id, field, offset = args.get('table'), args.get('id'), args.get('field'), args.get('offset', 0)
